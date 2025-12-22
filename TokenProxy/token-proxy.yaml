@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: token-proxy
+  namespace: ohif-ac
+  labels:
+    app: token-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: token-proxy
+  template:
+    metadata:
+      labels:
+        app: token-proxy
+    spec:
+      containers:
+      - name: token-proxy
+        image: node:18-alpine
+        command: ["/app/start-token-proxy.sh"]
+        ports:
+        - containerPort: 3000
+          protocol: TCP
+        envFrom:
+        - configMapRef:
+            name: token-proxy-config
+        - secretRef:
+            name: token-proxy-secret
+        volumeMounts:
+        - name: app-code
+          mountPath: /app/token-proxy-service.js
+          subPath: token-proxy-service.js
+        - name: start-script
+          mountPath: /app/start-token-proxy.sh
+          subPath: start-token-proxy.sh
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "50m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 15
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      volumes:
+      - name: app-code
+        configMap:
+          name: token-proxy-app
+          defaultMode: 0644
+      - name: start-script
+        configMap:
+          name: token-proxy-start-script
+          defaultMode: 0755
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: token-proxy-service
+  namespace: ohif-ac
+  labels:
+    app: token-proxy
+spec:
+  type: ClusterIP
+  ports:
+  - port: 3000
+    targetPort: 3000
+    protocol: TCP
+    name: http
+  selector:
+    app: token-proxy

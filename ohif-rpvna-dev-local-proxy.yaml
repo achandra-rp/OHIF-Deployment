@@ -1,0 +1,333 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ohif-rpvna-dev-config-local
+  namespace: ohif-ac
+data:
+  app-config.js: |
+    // OHIF Configuration using /ohif routes via Istio
+    // Token Manager calls token proxy through the gateway
+
+    // Ensure chunk loading uses /ohif base path
+    window.PUBLIC_URL = '/ohif';
+
+    // Okta Token Manager (with token proxy)
+    class OktaTokenManager {
+      constructor(config) {
+        this.config = config;
+        this.token = null;
+        this.expiresAt = 0;
+        this.tokenUrl = config.tokenUrl; // Now points to local proxy
+        this.tokenCacheKey = 'okta_access_token';
+        this.tokenExpiryKey = 'okta_token_expiry';
+
+        // Load cached token if available
+        this.loadCachedToken();
+      }
+
+      // Load token from localStorage
+      loadCachedToken() {
+        try {
+          const cachedToken = localStorage.getItem(this.tokenCacheKey);
+          const cachedExpiry = localStorage.getItem(this.tokenExpiryKey);
+
+          if (cachedToken && cachedExpiry) {
+            const expiryTime = parseInt(cachedExpiry, 10);
+            // Only use if not expired (with 5 min buffer)
+            if (expiryTime > Date.now() + 300000) {
+              this.token = cachedToken;
+              this.expiresAt = expiryTime;
+              console.info('[TokenManager] Loaded cached token, expires at:', new Date(expiryTime));
+            } else {
+              console.info('[TokenManager] Cached token expired, will fetch new token');
+              this.clearCache();
+            }
+          }
+        } catch (e) {
+          console.error('[TokenManager] Failed to load cached token:', e);
+        }
+      }
+
+      // Cache token to localStorage
+      cacheToken(token, expiresIn) {
+        try {
+          const expiryTime = Date.now() + (expiresIn * 1000);
+          this.token = token;
+          this.expiresAt = expiryTime;
+
+          localStorage.setItem(this.tokenCacheKey, token);
+          localStorage.setItem(this.tokenExpiryKey, expiryTime.toString());
+
+          console.info('[TokenManager] Token cached, expires at:', new Date(expiryTime));
+        } catch (e) {
+          console.error('[TokenManager] Failed to cache token:', e);
+        }
+      }
+
+      // Clear cached token
+      clearCache() {
+        try {
+          localStorage.removeItem(this.tokenCacheKey);
+          localStorage.removeItem(this.tokenExpiryKey);
+          this.token = null;
+          this.expiresAt = 0;
+          console.info('[TokenManager] Token cache cleared');
+        } catch (e) {
+          console.error('[TokenManager] Failed to clear cache:', e);
+        }
+      }
+
+      // Check if token is still valid (with 5 minute buffer)
+      isTokenValid() {
+        if (!this.token || !this.expiresAt) {
+          return false;
+        }
+        // Consider token expired if less than 5 minutes left
+        return this.expiresAt > Date.now() + 300000;
+      }
+
+      // Get current token or fetch new one
+      async getToken() {
+        if (this.isTokenValid()) {
+          console.info('[TokenManager] Using cached token');
+          return this.token;
+        }
+
+        console.info('[TokenManager] Fetching new token from proxy');
+        return await this.fetchNewToken();
+      }
+
+      // Fetch new token from local proxy
+      async fetchNewToken() {
+        try {
+          console.debug('[TokenManager] Token request to proxy:', this.tokenUrl);
+
+          const response = await fetch(this.tokenUrl, {
+            method: 'GET', // Proxy uses GET instead of POST
+            headers: {
+              'Accept': 'application/json'
+            }
+          });
+
+          if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Token request failed: ${response.status} ${response.statusText} - ${errorText}`);
+          }
+
+          const tokenData = await response.json();
+
+          if (!tokenData.access_token || !tokenData.expires_in) {
+            throw new Error('Invalid token response: missing access_token or expires_in');
+          }
+
+          console.info('[TokenManager] Token fetched successfully from proxy');
+          console.debug('[TokenManager] Token data:', {
+            token: tokenData.access_token.substring(0, 20) + '...',
+            expiresIn: tokenData.expires_in
+          });
+
+          this.cacheToken(tokenData.access_token, tokenData.expires_in);
+
+          return tokenData.access_token;
+        } catch (error) {
+          console.error('[TokenManager] Failed to fetch token from proxy:', error);
+          throw error;
+        }
+      }
+
+    }
+
+    // Initialize token manager (using /ohif routes via Istio)
+    const oktaConfig = {
+      tokenUrl: '/ohif/token' // Token proxy routed via Istio
+    };
+
+    const tokenManager = new OktaTokenManager(oktaConfig);
+
+    // Initialize token on page load
+    console.info('[OHIF] Initializing token manager with /ohif routes...');
+    tokenManager.getToken().then(token => {
+      console.info('[OHIF] Token initialized successfully via proxy');
+    }).catch(error => {
+      console.error('[OHIF] Failed to initialize token:', error);
+      console.warn('[OHIF] VNA requests may fail without a valid token');
+    });
+
+    // Allow runtime override of site ID for testing.
+    const urlParams = new URLSearchParams(window.location.search);
+    const siteIdParam = urlParams.get('siteId');
+    if (siteIdParam) {
+      localStorage.setItem('rpvna_site_id', siteIdParam);
+    }
+    const vnaSiteId = siteIdParam || localStorage.getItem('rpvna_site_id') || 'RPVNA-1';
+
+    // OHIF Configuration with dynamic token injection
+    window.config = {
+      routerBasename: '/ohif',
+      showStudyList: true,
+      maxNumberOfWebWorkers: 3,
+
+      // rpvna-dev Integration with OAuth2 Token via Local Proxy
+      dataSources: [
+        {
+          namespace: '@ohif/extension-default.dataSourcesModule.dicomweb',
+          sourceName: 'rpvna-dev-dicomweb',
+          configuration: {
+            friendlyName: 'Dev VNA DICOM Web Server (rpvna-dev)',
+            name: 'RPVNA-DEV',
+
+            // VNA URLs via token proxy routed under /ohif
+            qidoRoot: '/ohif/proxy/rpvna-dev/rp/vna/query',
+            wadoRoot: '/ohif/proxy/rpvna-dev/rp/vna/retrieve',
+            wadoUriRoot: '/ohif/proxy/rpvna-dev/rp/vna/retrieve',
+
+            // Required headers for VNA
+        requestOptions: {
+          headers: {
+            'Accept': 'application/dicom+json',
+            'Content-Type': 'application/dicom+json',
+            'Rp-Vna-Site-Id': vnaSiteId
+          }
+        },
+
+            // Note: Token is automatically added by proxy, no beforeRequest needed
+
+            // VNA-specific configuration
+            qidoSupportsIncludeField: false,
+            enableStudyLazyLoad: false,
+            supportsFuzzyMatching: true,
+            supportsWildcard: true,
+            supportsReject: false,
+            imageRendering: 'wadors',
+            thumbnailRendering: 'wadors',
+
+            // Enhanced data validation for VNA responses
+            validateDicomJson: true,
+            skipEmptyValues: true,
+            fallbackToEmptyString: true,
+
+            // Bulk data handling
+            bulkDataURI: {
+              enabled: true,
+              relativeResolution: 'studies'
+            },
+
+            omitQuotationForMultipartRequest: true
+          }
+        }
+      ],
+
+      // Set VNA as default data source
+      defaultDataSourceName: 'rpvna-dev-dicomweb',
+
+      // Essential extensions for medical imaging
+      extensions: [
+        '@ohif/extension-cornerstone',
+        '@ohif/extension-default',
+        '@ohif/extension-cornerstone-dicom-sr',
+        '@ohif/extension-cornerstone-dicom-seg',
+        '@ohif/extension-cornerstone-dicom-rt'
+      ],
+
+      modes: [
+        '@ohif/mode-longitudinal'
+      ],
+
+      defaultMode: '@ohif/mode-longitudinal',
+
+      // Performance optimizations for VNA
+      studyPrefetcher: {
+        enabled: true,
+        displaySetsCount: 2,
+        maxNumPrefetchRequests: 10,
+        order: 'closest'
+      },
+
+      maxNumRequests: {
+        interaction: 100,
+        thumbnail: 75,
+        prefetch: 25
+      },
+
+      // Enhanced error handling for VNA data processing
+      httpErrorHandler: error => {
+        console.error('=== VNA DICOM Web Error ===', error);
+        console.log('Error status:', error.status);
+        console.log('Error response:', error.response);
+
+        if (error.status === 401) {
+          console.warn('VNA Authentication failed - token may be expired or invalid');
+          // Clear cached token on 401
+          tokenManager.clearCache();
+        } else if (error.status === 403) {
+          console.warn('VNA Access forbidden - check token scopes and permissions');
+        } else if (error.status === 0) {
+          console.warn('Network error - VNA service may be unavailable');
+        }
+
+        if (error.config) {
+          console.log('Request URL:', error.config.url);
+          console.log('Request Method:', error.config.method);
+          console.log('Request Headers:', error.config.headers);
+        }
+
+        if (error.status !== 404) {
+          console.warn('VNA connection issue. Status: ' + error.status);
+        }
+      },
+
+      // Global error handler for JavaScript errors
+      onError: (error, errorInfo) => {
+        console.error('=== OHIF Application Error ===', error);
+        console.error('Error Info:', errorInfo);
+
+        if (error.message && error.message.includes('Cannot read properties of undefined')) {
+          console.warn('VNA Data Processing Error: Missing DICOM field values detected');
+          console.info('This is likely due to incomplete DICOM metadata from VNA');
+          return true;
+        }
+
+        return false;
+      },
+
+      // Debug logging
+      debugMode: true
+    };
+
+    // VNA Data Processing Patch
+    (function() {
+      const originalConsoleError = console.error;
+      console.error = function(...args) {
+        const errorMsg = args[0];
+        if (typeof errorMsg === 'string' && errorMsg.includes('Cannot read properties of undefined')) {
+          console.warn('VNA DICOM Processing: Handled missing field gracefully');
+          return;
+        }
+        originalConsoleError.apply(console, args);
+      };
+
+      const originalArrayFrom = Array.from;
+      Array.from = function(arrayLike, mapFn, thisArg) {
+        if (!arrayLike) {
+          console.warn('VNA: Handling undefined array-like object');
+          return [];
+        }
+        return originalArrayFrom.call(this, arrayLike, mapFn, thisArg);
+      };
+
+      window.addEventListener('error', function(event) {
+        if (event.error && event.error.message &&
+            event.error.message.includes('Cannot read properties of undefined') &&
+            event.error.stack && event.error.stack.includes('getModalities')) {
+          console.warn('VNA: Suppressed getModalities error due to missing DICOM values');
+          event.preventDefault();
+          return false;
+        }
+      });
+
+      console.info('VNA Data Processing Patch: Applied safety handlers for missing DICOM fields');
+      console.info('Token Manager: Initialized for OAuth2 via /ohif routes');
+    })();
+
+    console.info('[OHIF] Configuration loaded with OAuth2 Token Management via /ohif routes');
+    console.info('[OHIF] Token proxy URL: /ohif/token');

@@ -1,0 +1,49 @@
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: ohif-viewer
+  namespace: istio-gateway
+spec:
+  gateways:
+    - istio-system/istio-gateway
+  hosts:
+    - '*'
+  http:
+    - match:
+        - uri:
+            exact: /ohif/token
+      route:
+        - destination:
+            host: token-proxy-service.ohif-ac.svc.cluster.local
+            port:
+              number: 3000
+      rewrite:
+        uri: /token
+    - match:
+        - uri:
+            prefix: /ohif/proxy
+      route:
+        - destination:
+            host: token-proxy-service.ohif-ac.svc.cluster.local
+            port:
+              number: 3000
+      rewrite:
+        uri: /proxy
+    - match:
+        - uri:
+            exact: /ohif
+      route:
+        - destination:
+            host: ohif-rpvna-dev-viewer-service.ohif-ac.svc.cluster.local
+            port:
+              number: 80
+      rewrite:
+        uri: /ohif/
+    - match:
+        - uri:
+            prefix: /ohif
+      route:
+        - destination:
+            host: ohif-rpvna-dev-viewer-service.ohif-ac.svc.cluster.local
+            port:
+              number: 80
