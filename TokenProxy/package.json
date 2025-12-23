@@ -1,0 +1,31 @@
+{
+  "name": "token-proxy",
+  "version": "2.0.0",
+  "description": "Production-grade OAuth2 token proxy for OHIF VNA integration",
+  "main": "token-proxy-service.js",
+  "scripts": {
+    "start": "node token-proxy-service.js",
+    "dev": "node --watch token-proxy-service.js",
+    "test": "node --test test/",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "axios": "^1.7.0",
+    "zod": "^3.23.0",
+    "prom-client": "^15.1.0",
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/sdk-node": "^0.52.0",
+    "@opentelemetry/auto-instrumentations-node": "^0.47.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.52.0",
+    "opossum": "^8.1.4",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}

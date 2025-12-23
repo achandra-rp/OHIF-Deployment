@@ -1,615 +1,900 @@
-// Token Proxy Service for OAuth2 Client Credentials Flow
-// Fetches and caches OAuth2 tokens on behalf of browser applications
+'use strict';
+
+// Production Token Proxy Service for OAuth2 Client Credentials Flow
+// Implements all requirements from TOKEN-PROXY-PRODUCTION-REQUIREMENTS.md
 
 const express = require('express');
 const axios = require('axios');
-const crypto = require('crypto');
+const http = require('http');
+const https = require('https');
+const { z } = require('zod');
+const { v4: uuidv4 } = require('uuid');
+const promClient = require('prom-client');
+const { trace, context, SpanStatusCode } = require('@opentelemetry/api');
 
-// Configuration
-const config = {
-  // OAuth2 Provider Settings
-  tokenUrl: process.env.OAUTH_TOKEN_URL || 'https://ciam-radpartners.oktapreview.com/oauth2/ausi5i8tqwLfitWSI1d7/v1/token',
-  clientId: process.env.OAUTH_CLIENT_ID || '0oahv72jg6XGpk4Gd1d7',
-  clientSecret: process.env.OAUTH_CLIENT_SECRET || 'Q8q78Dl0TUQ_cqA-ymcbdb2Tz5acG0z1fmw1lawLaSTEp-enJOcCIuy03l5rPQ38',
-  scope: process.env.OAUTH_SCOPE || 'stream-dicom',
+// ============================================================================
+// Configuration Validation (Zod)
+// ============================================================================
 
-  // Server Settings
-  port: process.env.PORT || 3000,
-  host: process.env.HOST || '0.0.0.0',
+const configSchema = z.object({
+  PORT: z.coerce.number().default(3000),
+  HOST: z.string().default('0.0.0.0'),
+  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
 
-  // Token Cache Settings
-  defaultTokenTtl: parseInt(process.env.TOKEN_CACHE_TTL || '3300', 10), // 55 minutes
-  expiryBuffer: parseInt(process.env.TOKEN_EXPIRY_BUFFER || '300', 10), // 5 minutes
-  cleanupInterval: parseInt(process.env.CACHE_CLEANUP_INTERVAL || '600', 10), // 10 minutes
+  // OAuth2 settings
+  OAUTH_TOKEN_URL: z.string().url(),
+  OAUTH_CLIENT_ID: z.string().min(1),
+  OAUTH_CLIENT_SECRET: z.string().min(1),
+  OAUTH_SCOPE: z.string().min(1),
+  TOKEN_CACHE_TTL_SEC: z.coerce.number().default(3300),
+  TOKEN_EXPIRY_BUFFER_SEC: z.coerce.number().default(300),
+  TOKEN_TIMEOUT_MS: z.coerce.number().default(5000),
 
-  // Security
-  enableAuth: process.env.ENABLE_AUTH === 'true',
-  apiKey: process.env.API_KEY || null,
+  // VNA settings
+  VNA_BASE_URL: z.string().url(),
+  VNA_TIMEOUT_MS: z.coerce.number().default(10000),
 
-  // Logging
-  logLevel: process.env.LOG_LEVEL || 'info',
+  // Auth settings
+  PROXY_AUTH_MODE: z.enum(['none', 'api_key', 'jwt', 'mtls']).default('api_key'),
+  PROXY_API_KEY: z.string().optional(),
 
-  // Request Proxy Settings
-  enableProxy: true,  // Enable VNA proxy mode
-  upstreamTimeout: parseInt(process.env.UPSTREAM_TIMEOUT || '30000', 10),
-  vnaBaseUrl: process.env.VNA_BASE_URL || 'https://rp.dev.aws.radpartners.com/rpvna-dev'
-};
+  // Header allowlist
+  FORWARDED_HEADER_ALLOWLIST: z.string().default('accept,content-type,rp-vna-site-id'),
 
-// Simple in-memory cache with TTL
+  // Body size limit
+  BODY_SIZE_LIMIT_MB: z.coerce.number().default(10),
+
+  // Circuit breaker settings
+  CIRCUIT_BREAKER_TIMEOUT_MS: z.coerce.number().default(30000),
+  CIRCUIT_BREAKER_ERROR_THRESHOLD: z.coerce.number().default(50),
+  CIRCUIT_BREAKER_RESET_TIMEOUT_MS: z.coerce.number().default(30000),
+
+  // Retry settings
+  TOKEN_RETRY_COUNT: z.coerce.number().default(3),
+  TOKEN_RETRY_DELAY_MS: z.coerce.number().default(1000),
+
+  // OpenTelemetry
+  OTEL_EXPORTER_OTLP_ENDPOINT: z.string().optional(),
+  OTEL_SERVICE_NAME: z.string().default('token-proxy'),
+});
+
+let config;
+try {
+  config = configSchema.parse(process.env);
+} catch (err) {
+  console.error(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    level: 'ERROR',
+    message: 'Configuration validation failed',
+    errors: err.errors
+  }));
+  process.exit(1);
+}
+
+// ============================================================================
+// Logging (Structured, with request/trace IDs, secret redaction)
+// ============================================================================
+
+const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+const REDACTED_HEADERS = new Set(['authorization', 'cookie', 'x-api-key', 'proxy-authorization']);
+
+function log(level, message, meta = {}) {
+  if (LOG_LEVELS[level] < LOG_LEVELS[config.LOG_LEVEL]) {
+    return;
+  }
+
+  const sanitizedMeta = sanitizeLogMeta(meta);
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    level: level.toUpperCase(),
+    message,
+    service: config.OTEL_SERVICE_NAME,
+    ...sanitizedMeta
+  };
+
+  const output = JSON.stringify(logEntry);
+  if (level === 'error') {
+    console.error(output);
+  } else {
+    console.log(output);
+  }
+}
+
+function sanitizeLogMeta(meta) {
+  const sanitized = {};
+  for (const [key, value] of Object.entries(meta)) {
+    if (key.toLowerCase() === 'headers' && typeof value === 'object') {
+      sanitized[key] = sanitizeHeaders(value);
+    } else if (REDACTED_HEADERS.has(key.toLowerCase())) {
+      sanitized[key] = '[REDACTED]';
+    } else if (typeof value === 'string' && value.length > 100) {
+      sanitized[key] = value.substring(0, 100) + '...[truncated]';
+    } else {
+      sanitized[key] = value;
+    }
+  }
+  return sanitized;
+}
+
+function sanitizeHeaders(headers) {
+  const sanitized = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (REDACTED_HEADERS.has(key.toLowerCase())) {
+      sanitized[key] = '[REDACTED]';
+    } else {
+      sanitized[key] = value;
+    }
+  }
+  return sanitized;
+}
+
+// ============================================================================
+// Prometheus Metrics
+// ============================================================================
+
+const metricsRegistry = new promClient.Registry();
+promClient.collectDefaultMetrics({ register: metricsRegistry });
+
+const httpRequestDuration = new promClient.Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'Duration of HTTP requests in seconds',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+  registers: [metricsRegistry]
+});
+
+const httpRequestsTotal = new promClient.Counter({
+  name: 'http_requests_total',
+  help: 'Total number of HTTP requests',
+  labelNames: ['method', 'route', 'status_code'],
+  registers: [metricsRegistry]
+});
+
+const tokenFetchDuration = new promClient.Histogram({
+  name: 'token_fetch_duration_seconds',
+  help: 'Duration of token fetch requests in seconds',
+  buckets: [0.1, 0.25, 0.5, 1, 2, 5],
+  registers: [metricsRegistry]
+});
+
+const tokenFetchTotal = new promClient.Counter({
+  name: 'token_fetch_total',
+  help: 'Total number of token fetch attempts',
+  labelNames: ['status'],
+  registers: [metricsRegistry]
+});
+
+const tokenCacheHits = new promClient.Counter({
+  name: 'token_cache_hits_total',
+  help: 'Total number of token cache hits',
+  registers: [metricsRegistry]
+});
+
+const tokenCacheMisses = new promClient.Counter({
+  name: 'token_cache_misses_total',
+  help: 'Total number of token cache misses',
+  registers: [metricsRegistry]
+});
+
+const upstreamRequestDuration = new promClient.Histogram({
+  name: 'upstream_request_duration_seconds',
+  help: 'Duration of upstream VNA requests in seconds',
+  labelNames: ['method', 'status_code'],
+  buckets: [0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+  registers: [metricsRegistry]
+});
+
+const circuitBreakerState = new promClient.Gauge({
+  name: 'circuit_breaker_state',
+  help: 'Circuit breaker state (0=closed, 1=open, 2=half-open)',
+  labelNames: ['name'],
+  registers: [metricsRegistry]
+});
+
+const errorsByStatusCode = new promClient.Counter({
+  name: 'errors_by_status_code_total',
+  help: 'Total errors by status code',
+  labelNames: ['status_code', 'endpoint'],
+  registers: [metricsRegistry]
+});
+
+// ============================================================================
+// Circuit Breaker
+// ============================================================================
+
+const CircuitBreaker = require('opossum');
+
+function createCircuitBreaker(fn, name) {
+  const breaker = new CircuitBreaker(fn, {
+    timeout: config.CIRCUIT_BREAKER_TIMEOUT_MS,
+    errorThresholdPercentage: config.CIRCUIT_BREAKER_ERROR_THRESHOLD,
+    resetTimeout: config.CIRCUIT_BREAKER_RESET_TIMEOUT_MS,
+    name
+  });
+
+  breaker.on('open', () => {
+    circuitBreakerState.set({ name }, 1);
+    log('warn', `Circuit breaker opened: ${name}`);
+  });
+
+  breaker.on('halfOpen', () => {
+    circuitBreakerState.set({ name }, 2);
+    log('info', `Circuit breaker half-open: ${name}`);
+  });
+
+  breaker.on('close', () => {
+    circuitBreakerState.set({ name }, 0);
+    log('info', `Circuit breaker closed: ${name}`);
+  });
+
+  circuitBreakerState.set({ name }, 0);
+  return breaker;
+}
+
+// ============================================================================
+// Token Cache with Singleflight Pattern
+// ============================================================================
+
 class TokenCache {
   constructor() {
-    this.cache = new Map();
-    this.lastCleanup = Date.now();
+    this.token = null;
+    this.expiresAtMs = 0;
+    this.inflightPromise = null;
   }
 
-  get(key) {
-    this.cleanupIfNeeded();
-    const item = this.cache.get(key);
-    if (!item) return null;
+  isValid(nowMs, bufferMs) {
+    return this.token && (this.expiresAtMs - bufferMs) > nowMs;
+  }
 
-    if (item.expiresAt <= Date.now()) {
-      this.cache.delete(key);
-      return null;
+  async getToken(fetchFn, nowMs, bufferSec) {
+    if (this.isValid(nowMs, bufferSec * 1000)) {
+      tokenCacheHits.inc();
+      return this.token;
     }
 
-    return item.value;
-  }
+    tokenCacheMisses.inc();
 
-  set(key, value, ttlSeconds) {
-    const expiresAt = Date.now() + (ttlSeconds * 1000);
-    this.cache.set(key, { value, expiresAt });
-    return value;
-  }
-
-  delete(key) {
-    return this.cache.delete(key);
-  }
-
-  cleanupIfNeeded() {
-    const now = Date.now();
-    if (now - this.lastCleanup < config.cleanupInterval * 1000) return;
-
-    this.lastCleanup = now;
-    let cleaned = 0;
-
-    for (const [key, item] of this.cache.entries()) {
-      if (item.expiresAt <= now) {
-        this.cache.delete(key);
-        cleaned++;
-      }
+    if (!this.inflightPromise) {
+      this.inflightPromise = fetchFn()
+        .then(tokenResponse => {
+          this.token = tokenResponse.access_token;
+          this.expiresAtMs = nowMs + (tokenResponse.expires_in * 1000);
+          this.inflightPromise = null;
+          return this.token;
+        })
+        .catch(err => {
+          this.inflightPromise = null;
+          throw err;
+        });
     }
 
-    if (cleaned > 0) {
-      log('debug', `Cache cleanup removed ${cleaned} expired tokens`);
-    }
+    return this.inflightPromise;
   }
 
   clear() {
-    const size = this.cache.size;
-    this.cache.clear();
-    log('info', `Cache cleared, removed ${size} tokens`);
-  }
-
-  size() {
-    this.cleanupIfNeeded();
-    return this.cache.size;
+    this.token = null;
+    this.expiresAtMs = 0;
+    this.inflightPromise = null;
   }
 }
 
-// Token Service
-class TokenService {
-  constructor(cache) {
-    this.cache = cache;
-    this.fetching = new Map(); // Prevent concurrent fetches for same token
-  }
+const tokenCache = new TokenCache();
 
-  /**
-   * Get a valid token from cache or fetch a new one
-   */
-  async getToken() {
-    const cacheKey = this.getCacheKey();
-    const cachedToken = this.cache.get(cacheKey);
+// ============================================================================
+// Token Fetch with Retries and Exponential Backoff
+// ============================================================================
 
-    if (cachedToken) {
-      log('info', 'Returning cached token');
-      return cachedToken;
+async function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function fetchTokenWithRetry() {
+  const tracer = trace.getTracer(config.OTEL_SERVICE_NAME);
+
+  return tracer.startActiveSpan('fetchToken', async (span) => {
+    const endTimer = tokenFetchDuration.startTimer();
+    let lastError;
+
+    for (let attempt = 1; attempt <= config.TOKEN_RETRY_COUNT; attempt++) {
+      try {
+        span.setAttribute('attempt', attempt);
+
+        const payload = new URLSearchParams({
+          grant_type: 'client_credentials',
+          scope: config.OAUTH_SCOPE
+        });
+
+        const response = await axios.post(config.OAUTH_TOKEN_URL, payload.toString(), {
+          auth: {
+            username: config.OAUTH_CLIENT_ID,
+            password: config.OAUTH_CLIENT_SECRET
+          },
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': 'application/json'
+          },
+          timeout: config.TOKEN_TIMEOUT_MS
+        });
+
+        if (!response.data.access_token || !response.data.expires_in) {
+          throw new Error('Invalid token response: missing access_token or expires_in');
+        }
+
+        endTimer();
+        tokenFetchTotal.inc({ status: 'success' });
+        span.setStatus({ code: SpanStatusCode.OK });
+        span.end();
+
+        log('info', 'Token fetched successfully', {
+          attempt,
+          expiresIn: response.data.expires_in
+        });
+
+        return response.data;
+
+      } catch (err) {
+        lastError = err;
+        log('warn', `Token fetch attempt ${attempt} failed`, {
+          attempt,
+          error: err.message,
+          status: err.response?.status
+        });
+
+        if (attempt < config.TOKEN_RETRY_COUNT) {
+          const delayMs = config.TOKEN_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+          await sleep(delayMs);
+        }
+      }
     }
 
-    // Check if token is currently being fetched (prevent thundering herd)
-    if (this.fetching.has(cacheKey)) {
-      log('debug', 'Token fetch already in progress, waiting...');
-      return this.fetching.get(cacheKey);
+    endTimer();
+    tokenFetchTotal.inc({ status: 'failure' });
+    span.setStatus({ code: SpanStatusCode.ERROR, message: lastError.message });
+    span.end();
+
+    log('error', 'Token fetch failed after all retries', {
+      error: lastError.message,
+      attempts: config.TOKEN_RETRY_COUNT
+    });
+
+    throw lastError;
+  });
+}
+
+const tokenFetchBreaker = createCircuitBreaker(fetchTokenWithRetry, 'tokenFetch');
+
+// ============================================================================
+// Header Allowlist and Validation
+// ============================================================================
+
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailers',
+  'transfer-encoding',
+  'upgrade'
+]);
+
+function buildForwardHeaders(req, token, siteId) {
+  const allowlist = new Set(
+    config.FORWARDED_HEADER_ALLOWLIST.split(',').map(h => h.trim().toLowerCase())
+  );
+  const headers = {};
+
+  for (const [key, value] of Object.entries(req.headers)) {
+    const lowerKey = key.toLowerCase();
+
+    if (HOP_BY_HOP_HEADERS.has(lowerKey)) {
+      continue;
     }
 
-    // Fetch new token
-    log('info', 'No valid cached token, fetching from OAuth provider');
-    const fetchPromise = this.fetchTokenFromProvider()
-      .then(token => {
-        this.fetching.delete(cacheKey);
-        return token;
-      })
-      .catch(error => {
-        this.fetching.delete(cacheKey);
-        throw error;
-      });
+    if (!allowlist.has(lowerKey)) {
+      continue;
+    }
 
-    this.fetching.set(cacheKey, fetchPromise);
-    return fetchPromise;
+    headers[key] = value;
   }
 
-  /**
-   * Fetch token directly from OAuth provider (bypass cache)
-   */
-  async fetchTokenFromProvider() {
+  headers['Authorization'] = `Bearer ${token}`;
+  headers['Accept'] = 'application/dicom+json';
+  if (req.method !== 'GET') {
+    headers['Content-Type'] = 'application/dicom+json';
+  }
+  headers['Rp-Vna-Site-Id'] = siteId;
+
+  return headers;
+}
+
+// ============================================================================
+// HTTP Keep-Alive Agents
+// ============================================================================
+
+const keepAliveHttpAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 50,
+  maxFreeSockets: 10,
+  timeout: 60000
+});
+
+const keepAliveHttpsAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 50,
+  maxFreeSockets: 10,
+  timeout: 60000
+});
+
+// ============================================================================
+// VNA Request Handler with Circuit Breaker
+// ============================================================================
+
+async function makeVnaRequest(requestConfig) {
+  const tracer = trace.getTracer(config.OTEL_SERVICE_NAME);
+
+  return tracer.startActiveSpan('vnaRequest', async (span) => {
+    span.setAttribute('http.method', requestConfig.method);
+    span.setAttribute('http.url', requestConfig.url);
+
+    const endTimer = upstreamRequestDuration.startTimer({
+      method: requestConfig.method
+    });
+
     try {
-      log('info', 'Fetching new token from OAuth provider', { tokenUrl: maskUrl(config.tokenUrl) });
-
-      const tokenRequestBody = new URLSearchParams({
-        grant_type: 'client_credentials',
-        client_id: config.clientId,
-        client_secret: config.clientSecret,
-        scope: config.scope
+      const response = await axios({
+        ...requestConfig,
+        httpAgent: keepAliveHttpAgent,
+        httpsAgent: keepAliveHttpsAgent,
+        timeout: config.VNA_TIMEOUT_MS,
+        maxRedirects: 5,
+        validateStatus: () => true
       });
 
-      const response = await axios.post(config.tokenUrl, tokenRequestBody.toString(), {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Accept': 'application/json'
-        },
-        timeout: config.upstreamTimeout
-      });
+      endTimer({ status_code: response.status });
+      span.setAttribute('http.status_code', response.status);
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
 
-      if (!response.data.access_token || !response.data.expires_in) {
-        throw new Error('Invalid token response: missing access_token or expires_in');
-      }
+      return response;
 
-      const token = {
-        access_token: response.data.access_token,
-        token_type: response.data.token_type || 'Bearer',
-        expires_in: response.data.expires_in,
-        scope: response.data.scope || config.scope,
-        obtained_at: Math.floor(Date.now() / 1000)
-      };
-
-      log('info', 'Token fetched successfully', {
-        expiresIn: token.expires_in,
-        scope: token.scope
-      });
-
-      log('debug', 'Token details', {
-        tokenPreview: token.access_token.substring(0, 20) + '...',
-        tokenType: token.token_type
-      });
-
-      // Cache token with expiry buffer
-      const cacheTtl = Math.max(1, token.expires_in - config.expiryBuffer);
-      const cacheKey = this.getCacheKey();
-      this.cache.set(cacheKey, token, cacheTtl);
-
-      log('info', `Token cached for ${cacheTtl} seconds (with ${config.expiryBuffer}s buffer)`);
-
-      return token;
-    } catch (error) {
-      log('error', 'Failed to fetch token from OAuth provider', {
-        error: error.message,
-        status: error.response?.status,
-        statusText: error.response?.statusText,
-        responseData: error.response?.data
-      });
-      throw error;
+    } catch (err) {
+      endTimer({ status_code: 'error' });
+      span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+      span.end();
+      throw err;
     }
-  }
+  });
+}
 
-  /**
-   * Clear cached token (useful after 401 errors)
-   */
-  clearToken() {
-    const cacheKey = this.getCacheKey();
-    this.cache.delete(cacheKey);
-    log('info', 'Token cleared from cache');
-  }
+const vnaRequestBreaker = createCircuitBreaker(makeVnaRequest, 'vnaRequest');
 
-  /**
-   * Get cache key based on client_id and scope
-   */
-  getCacheKey() {
-    const scopeHash = crypto.createHash('md5').update(config.scope).digest('hex');
-    return `token:${config.clientId}:${scopeHash}`;
-  }
+// ============================================================================
+// Express Application
+// ============================================================================
 
-  /**
-   * Get cache statistics
-   */
-  getCacheStats() {
-    return {
-      size: this.cache.size(),
-      config: {
-        tokenCacheTtl: config.defaultTokenTtl,
-        expiryBuffer: config.expiryBuffer,
-        clientId: maskString(config.clientId, 4, 4)
-      }
+const app = express();
+
+// Body parser with size limit
+const bodySizeLimit = `${config.BODY_SIZE_LIMIT_MB}mb`;
+app.use(express.json({ limit: bodySizeLimit }));
+app.use(express.urlencoded({ extended: true, limit: bodySizeLimit }));
+app.use(express.raw({ limit: bodySizeLimit, type: 'application/dicom' }));
+
+// Request ID and Trace ID middleware
+app.use((req, res, next) => {
+  req.requestId = req.headers['x-request-id'] || uuidv4();
+  req.traceId = req.headers['x-trace-id'] || uuidv4();
+  res.setHeader('X-Request-Id', req.requestId);
+  res.setHeader('X-Trace-Id', req.traceId);
+  next();
+});
+
+// Metrics middleware
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+
+  res.on('finish', () => {
+    const durationNs = Number(process.hrtime.bigint() - start);
+    const durationSec = durationNs / 1e9;
+
+    const route = req.route?.path || req.path;
+    const labels = {
+      method: req.method,
+      route,
+      status_code: res.statusCode
     };
+
+    httpRequestDuration.observe(labels, durationSec);
+    httpRequestsTotal.inc(labels);
+
+    if (res.statusCode >= 400) {
+      errorsByStatusCode.inc({
+        status_code: res.statusCode,
+        endpoint: route
+      });
+    }
+  });
+
+  next();
+});
+
+// Request logging middleware
+app.use((req, res, next) => {
+  const start = Date.now();
+
+  res.on('finish', () => {
+    const durationMs = Date.now() - start;
+    log('info', `${req.method} ${req.path} ${res.statusCode}`, {
+      requestId: req.requestId,
+      traceId: req.traceId,
+      durationMs,
+      method: req.method,
+      path: req.path,
+      statusCode: res.statusCode,
+      userAgent: req.headers['user-agent']
+    });
+  });
+
+  next();
+});
+
+// CORS middleware
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-API-Key, Rp-Vna-Site-Id, X-Request-Id, X-Trace-Id');
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
   }
+  next();
+});
+
+// API Key authentication middleware
+function requireApiKey(req, res, next) {
+  if (config.PROXY_AUTH_MODE !== 'api_key') {
+    return next();
+  }
+
+  if (req.path === '/health' || req.path === '/ready' || req.path === '/metrics') {
+    return next();
+  }
+
+  const apiKey = req.header('x-api-key');
+  if (!apiKey || apiKey !== config.PROXY_API_KEY) {
+    log('warn', 'Unauthorized request - invalid API key', {
+      requestId: req.requestId,
+      path: req.path
+    });
+    return res.status(401).json({
+      error: 'unauthorized',
+      code: 'INVALID_API_KEY',
+      message: 'Invalid or missing API key',
+      requestId: req.requestId
+    });
+  }
+
+  next();
 }
 
-// Express App
-class TokenProxyApp {
-  constructor() {
-    this.app = express();
-    this.cache = new TokenCache();
-    this.tokenService = new TokenService(this.cache);
-    this.setupMiddleware();
-    this.setupRoutes();
-  }
+app.use(requireApiKey);
 
-  setupMiddleware() {
-    // Body parser for JSON
-    this.app.use(express.json({ limit: '10mb' }));
-    this.app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+// ============================================================================
+// Routes
+// ============================================================================
 
-    // CORS
-    this.app.use((req, res, next) => {
-      res.header('Access-Control-Allow-Origin', '*');
-      res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-      res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-API-Key');
+// Health check
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    service: config.OTEL_SERVICE_NAME
+  });
+});
 
-      if (req.method === 'OPTIONS') {
-        res.sendStatus(200);
-      } else {
-        next();
-      }
+// Readiness check
+app.get('/ready', async (req, res) => {
+  try {
+    // Check if we can get a token (validates Okta connectivity)
+    const nowMs = Date.now();
+    await tokenCache.getToken(
+      () => tokenFetchBreaker.fire(),
+      nowMs,
+      config.TOKEN_EXPIRY_BUFFER_SEC
+    );
+
+    res.json({
+      status: 'ready',
+      timestamp: new Date().toISOString()
     });
-
-    // API Key authentication (optional)
-    if (config.enableAuth && config.apiKey) {
-      this.app.use((req, res, next) => {
-        if (req.path === '/health' || req.path === '/ready') {
-          return next();
-        }
-
-        const apiKey = req.headers['x-api-key'] || req.query.apiKey;
-        if (!apiKey || apiKey !== config.apiKey) {
-          return res.status(401).json({ error: 'Unauthorized', message: 'Invalid or missing API key' });
-        }
-        next();
-      });
-    }
-
-    // Request logging
-    this.app.use((req, res, next) => {
-      const start = Date.now();
-      const originalSend = res.send;
-
-      res.send = function(body) {
-        res.send = originalSend;
-        const duration = Date.now() - start;
-        log('info', `${req.method} ${req.path} ${res.statusCode} - ${duration}ms`);
-        return res.send(body);
-      };
-
-      next();
+  } catch (err) {
+    res.status(503).json({
+      status: 'not_ready',
+      timestamp: new Date().toISOString(),
+      error: 'Unable to fetch token'
     });
   }
+});
 
-  setupRoutes() {
-    // Health check
-    this.app.get('/health', (req, res) => {
-      res.json({
-        status: 'healthy',
-        timestamp: new Date().toISOString(),
-        service: 'token-proxy'
-      });
-    });
-
-    // Readiness check
-    this.app.get('/ready', (req, res) => {
-      res.json({
-        status: 'ready',
-        timestamp: new Date().toISOString()
-      });
-    });
-
-    // Get token endpoint (simple)
-    this.app.get('/token', async (req, res) => {
-      try {
-        const token = await this.tokenService.getToken();
-        res.json({
-          access_token: token.access_token,
-          token_type: token.token_type,
-          expires_in: token.expires_in - config.expiryBuffer
-        });
-      } catch (error) {
-        res.status(500).json({
-          error: 'token_fetch_failed',
-          message: 'Failed to fetch OAuth2 token',
-          details: error.message
-        });
-      }
-    });
-
-    // Get token with full details
-    this.app.get('/token/details', async (req, res) => {
-      try {
-        const token = await this.tokenService.getToken();
-        res.json(token);
-      } catch (error) {
-        res.status(500).json({
-          error: 'token_fetch_failed',
-          message: 'Failed to fetch OAuth2 token',
-          details: error.message
-        });
-      }
-    });
-
-    // Clear cached token
-    this.app.post('/token/clear', (req, res) => {
-      this.tokenService.clearToken();
-      res.json({ message: 'Token cleared from cache' });
-    });
-
-    // Cache statistics
-    this.app.get('/cache/stats', (req, res) => {
-      res.json(this.tokenService.getCacheStats());
-    });
-
-    // Proxy mode: Forward requests to upstream with token injection
-    if (config.enableProxy) {
-      this.app.use('/proxy', async (req, res) => {
-        await this.handleProxy(req, res);
-      });
-    }
-
-    // Default route
-    this.app.get('/', (req, res) => {
-      res.json({
-        service: 'token-proxy',
-        version: '1.0.0',
-        endpoints: [
-          { path: '/health', description: 'Health check' },
-          { path: '/token', description: 'Get OAuth2 access token' },
-          { path: '/token/details', description: 'Get token with full details' },
-          { path: '/token/clear', method: 'POST', description: 'Clear cached token' },
-          { path: '/cache/stats', description: 'Cache statistics' }
-        ],
-        proxyEnabled: config.enableProxy
-      });
-    });
-
-    // Error handler
-    this.app.use((error, req, res, next) => {
-      log('error', 'Unhandled error', {
-        error: error.message,
-        stack: error.stack,
-        path: req.path,
-        method: req.method
-      });
-
-      res.status(500).json({
-        error: 'internal_error',
-        message: 'An unexpected error occurred'
-      });
-    });
-
-    // 404 handler
-    this.app.use((req, res) => {
-      res.status(404).json({
-        error: 'not_found',
-        message: `Endpoint ${req.method} ${req.path} not found`
-      });
-    });
+// Prometheus metrics endpoint
+app.get('/metrics', async (req, res) => {
+  try {
+    res.set('Content-Type', metricsRegistry.contentType);
+    res.end(await metricsRegistry.metrics());
+  } catch (err) {
+    res.status(500).json({ error: 'metrics_error' });
   }
+});
 
-  /**
-   * Handle proxy requests - forward to upstream with token injection
-   */
-  async handleProxy(req, res) {
+// Token endpoint
+app.get('/token', async (req, res) => {
+  const tracer = trace.getTracer(config.OTEL_SERVICE_NAME);
+
+  return tracer.startActiveSpan('getToken', async (span) => {
     try {
-      const token = await this.tokenService.getToken();
-      // Build target URL - req.url includes query params, remove /proxy prefix
-      let urlWithoutProxy = req.url.replace(/^\/proxy\/?/, '');
+      const nowMs = Date.now();
+      const token = await tokenCache.getToken(
+        () => tokenFetchBreaker.fire(),
+        nowMs,
+        config.TOKEN_EXPIRY_BUFFER_SEC
+      );
 
-      log('info', 'Processing proxy request', {
-        reqUrl: req.url,
-        urlWithoutProxy: urlWithoutProxy,
-        vnaBaseUrl: config.vnaBaseUrl,
-        isInternalDns: config.vnaBaseUrl.includes('.svc.cluster.local')
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
+
+      res.json({
+        access_token: token,
+        token_type: 'Bearer',
+        expires_in: config.TOKEN_CACHE_TTL_SEC - config.TOKEN_EXPIRY_BUFFER_SEC
       });
 
-      // When using internal cluster DNS, strip the VNA environment name from the path
-      // Internal VNA services don't need the environment name in the URL path
-      // Example: query-rs-v1.rpvna-dev.svc.cluster.local/rp/vna/... (not /rpvna-dev/rp/vna/...)
-      if (config.vnaBaseUrl.includes('.svc.cluster.local') && !urlWithoutProxy.startsWith('/rp/vna/')) {
-        log('info', 'Stripping VNA environment from path');
-        const originalUrl = urlWithoutProxy;
-        // Match leading slash + environment name + slash (e.g., /rpvna-dev/)
-        urlWithoutProxy = urlWithoutProxy.replace(/^\/[^\/]+\//, '/');
-        log('info', 'Path modified', {
-          original: originalUrl,
-          modified: urlWithoutProxy
-        });
+    } catch (err) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+      span.end();
+
+      log('error', 'Token fetch failed', {
+        requestId: req.requestId,
+        error: err.message
+      });
+
+      res.status(503).json({
+        error: 'token_fetch_failed',
+        code: 'TOKEN_UNAVAILABLE',
+        message: 'Failed to fetch OAuth2 token',
+        requestId: req.requestId
+      });
+    }
+  });
+});
+
+// Clear token cache
+app.post('/token/clear', (req, res) => {
+  tokenCache.clear();
+  log('info', 'Token cache cleared', { requestId: req.requestId });
+  res.json({
+    message: 'Token cache cleared',
+    requestId: req.requestId
+  });
+});
+
+// Proxy endpoint
+app.use('/proxy', async (req, res) => {
+  const tracer = trace.getTracer(config.OTEL_SERVICE_NAME);
+
+  return tracer.startActiveSpan('proxyRequest', async (span) => {
+    try {
+      // Get token
+      const nowMs = Date.now();
+      const token = await tokenCache.getToken(
+        () => tokenFetchBreaker.fire(),
+        nowMs,
+        config.TOKEN_EXPIRY_BUFFER_SEC
+      );
+
+      // Build target URL
+      let urlPath = req.url.replace(/^\/?proxy\/?/, '');
+
+      // Strip VNA environment prefix for internal cluster DNS
+      if (config.VNA_BASE_URL.includes('.svc.cluster.local') && !urlPath.startsWith('/rp/vna/')) {
+        urlPath = urlPath.replace(/^\/[^\/]+\//, '/');
       }
 
-      const targetUrl = config.vnaBaseUrl + (urlWithoutProxy.startsWith('/') ? '' : '/') + urlWithoutProxy;
+      const targetUrl = config.VNA_BASE_URL + (urlPath.startsWith('/') ? '' : '/') + urlPath;
 
-      log('info', 'Proxying VNA request with token', {
-        requestedPath: req.url,
-        targetUrl: maskUrl(targetUrl),
+      // Get site ID from headers
+      const siteId = req.headers['rp-vna-site-id'] || 'RPVNA-1';
+
+      // Build forward headers
+      const headers = buildForwardHeaders(req, token, siteId);
+
+      span.setAttribute('proxy.target_url', targetUrl);
+      span.setAttribute('proxy.site_id', siteId);
+
+      log('debug', 'Proxying request', {
+        requestId: req.requestId,
         method: req.method,
-        isInternalDns: config.vnaBaseUrl.includes('.svc.cluster.local')
+        targetUrl: targetUrl.replace(/\/\/[^\/]+/, '//[host]'),
+        siteId
       });
 
-      // Extract VNA site ID from request headers (if provided)
-      const vnaSiteId = req.headers['rp-vna-site-id'] || req.headers['Rp-Vna-Site-Id'] || 'RPVNA-1';
-
-      // Build request config with all required VNA headers
-      const requestConfig = {
+      // Make request through circuit breaker
+      const response = await vnaRequestBreaker.fire({
         method: req.method,
         url: targetUrl,
-        headers: {
-          ...req.headers,
-          'Authorization': `Bearer ${token.access_token}`,
-          'Rp-Vna-Site-Id': vnaSiteId,
-          'Accept': 'application/dicom+json',
-          'Content-Type': req.method === 'GET' ? undefined : 'application/dicom+json',
-          'host': undefined // Let axios set the host
-        },
-        params: req.query,
-        data: req.body,
-        timeout: config.upstreamTimeout,
-        maxRedirects: 5,
-        validateStatus: null // Don't throw on error status codes
-      };
+        headers,
+        data: req.body
+      });
 
-      const response = await axios(requestConfig);
-
-      // Forward response
+      // Forward response status
       res.status(response.status);
 
-      // Copy important headers from upstream
-      const headersToForward = [
+      // Forward safe response headers
+      const safeResponseHeaders = [
         'content-type',
         'content-length',
         'cache-control',
-        'access-control-allow-origin',
-        'access-control-allow-headers',
-        'access-control-allow-methods'
+        'etag',
+        'last-modified'
       ];
 
-      Object.keys(response.headers).forEach(key => {
-        try {
-          if (headersToForward.includes(key.toLowerCase())) {
-            res.setHeader(key, response.headers[key]);
-          }
-        } catch (e) {
-          // Ignore headers that can't be set
+      for (const header of safeResponseHeaders) {
+        if (response.headers[header]) {
+          res.setHeader(header, response.headers[header]);
         }
-      });
+      }
 
-      // Ensure CORS is allowed from any origin for browser access
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, Rp-Vna-Site-Id, Accept');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      span.setAttribute('http.response.status_code', response.status);
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
 
       res.send(response.data);
-    } catch (error) {
+
+    } catch (err) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+      span.end();
+
       log('error', 'Proxy request failed', {
-        error: error.message,
-        path: req.path,
-        method: req.method
+        requestId: req.requestId,
+        error: err.message,
+        path: req.path
       });
 
-      if (error.response) {
-        res.status(error.response.status || 502).json({
+      if (err.response) {
+        res.status(err.response.status || 502).json({
           error: 'proxy_error',
+          code: 'UPSTREAM_ERROR',
           message: 'Upstream request failed',
-          details: error.response.data
+          statusCode: err.response.status,
+          requestId: req.requestId
+        });
+      } else if (err.code === 'EOPENBREAKER') {
+        res.status(503).json({
+          error: 'service_unavailable',
+          code: 'CIRCUIT_OPEN',
+          message: 'Service temporarily unavailable due to upstream failures',
+          requestId: req.requestId
         });
       } else {
         res.status(502).json({
           error: 'proxy_error',
-          message: 'Failed to connect to upstream'
+          code: 'CONNECTION_FAILED',
+          message: 'Failed to connect to upstream',
+          requestId: req.requestId
         });
       }
     }
-  }
+  });
+});
 
-  start() {
-    return new Promise((resolve, reject) => {
-      try {
-        const server = this.app.listen(config.port, config.host, () => {
-          log('info', `Token proxy server started`, {
-            host: config.host,
-            port: config.port,
-            oauthProvider: maskUrl(config.tokenUrl),
-            tokenCacheEnabled: true,
-            tokenCacheTtl: config.defaultTokenTtl,
-            proxyEnabled: config.enableProxy
-          });
-          resolve(server);
-        });
+// Root endpoint - service info
+app.get('/', (req, res) => {
+  res.json({
+    service: config.OTEL_SERVICE_NAME,
+    version: '2.0.0',
+    endpoints: [
+      { path: '/health', method: 'GET', description: 'Liveness probe' },
+      { path: '/ready', method: 'GET', description: 'Readiness probe' },
+      { path: '/metrics', method: 'GET', description: 'Prometheus metrics' },
+      { path: '/token', method: 'GET', description: 'Get OAuth2 access token' },
+      { path: '/token/clear', method: 'POST', description: 'Clear token cache' },
+      { path: '/proxy/*', method: 'ALL', description: 'VNA proxy endpoint' }
+    ]
+  });
+});
 
-        server.on('error', (error) => {
-          log('error', 'Server failed to start', { error: error.message });
-          reject(error);
-        });
-      } catch (error) {
-        reject(error);
-      }
-    });
-  }
-}
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'not_found',
+    code: 'ENDPOINT_NOT_FOUND',
+    message: `Endpoint ${req.method} ${req.path} not found`,
+    requestId: req.requestId
+  });
+});
 
-// Logging utilities
-function log(level, message, meta = {}) {
-  const levels = ['debug', 'info', 'warn', 'error'];
-  if (levels.indexOf(level) < levels.indexOf(config.logLevel)) {
-    return;
-  }
+// Error handler
+app.use((err, req, res, next) => {
+  log('error', 'Unhandled error', {
+    requestId: req.requestId,
+    error: err.message,
+    stack: err.stack
+  });
 
-  const timestamp = new Date().toISOString();
-  const logEntry = {
-    timestamp,
-    level: level.toUpperCase(),
-    message,
-    ...meta
-  };
+  res.status(500).json({
+    error: 'internal_error',
+    code: 'INTERNAL_SERVER_ERROR',
+    message: 'An unexpected error occurred',
+    requestId: req.requestId
+  });
+});
 
-  if (level === 'error') {
-    console.error(JSON.stringify(logEntry));
-  } else {
-    console.log(JSON.stringify(logEntry));
-  }
-}
+// ============================================================================
+// Server Startup and Graceful Shutdown
+// ============================================================================
 
-function maskUrl(url) {
-  if (!url || typeof url !== 'string') return url;
-  try {
-    const urlObj = new URL(url);
-    return `${urlObj.protocol}//${urlObj.hostname}${urlObj.pathname}`;
-  } catch (e) {
-    return url;
-  }
-}
+let server;
 
-function maskString(str, showFirst = 4, showLast = 4) {
-  if (!str || typeof str !== 'string') return str;
-  if (str.length <= showFirst + showLast) return str;
-  return str.substring(0, showFirst) + '****' + str.substring(str.length - showLast);
-}
-
-// Graceful shutdown
-function setupGracefulShutdown(server) {
-  const shutdown = async (signal) => {
-    log('info', `Received ${signal}, shutting down gracefully...`);
-
-    try {
-      await new Promise((resolve) => {
-        server.close(resolve);
+function startServer() {
+  return new Promise((resolve, reject) => {
+    server = app.listen(config.PORT, config.HOST, () => {
+      log('info', 'Token proxy server started', {
+        host: config.HOST,
+        port: config.PORT,
+        authMode: config.PROXY_AUTH_MODE,
+        vnaBaseUrl: config.VNA_BASE_URL.replace(/\/\/[^\/]+/, '//[host]')
       });
-      log('info', 'Server closed');
-      process.exit(0);
-    } catch (error) {
-      log('error', 'Error during shutdown', { error: error.message });
-      process.exit(1);
-    }
-  };
+      resolve(server);
+    });
 
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
+    server.on('error', (err) => {
+      log('error', 'Server failed to start', { error: err.message });
+      reject(err);
+    });
+
+    // Set keep-alive timeout
+    server.keepAliveTimeout = 65000;
+    server.headersTimeout = 66000;
+  });
 }
+
+async function gracefulShutdown(signal) {
+  log('info', `Received ${signal}, initiating graceful shutdown`);
+
+  if (server) {
+    await new Promise((resolve) => {
+      server.close(resolve);
+    });
+    log('info', 'Server closed');
+  }
+
+  // Close HTTP agents
+  keepAliveHttpAgent.destroy();
+  keepAliveHttpsAgent.destroy();
+
+  log('info', 'Shutdown complete');
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Handle uncaught errors
+process.on('uncaughtException', (err) => {
+  log('error', 'Uncaught exception', { error: err.message, stack: err.stack });
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  log('error', 'Unhandled rejection', { reason: String(reason) });
+});
 
 // Start server if run directly
 if (require.main === module) {
-  const app = new TokenProxyApp();
-
-  app.start()
-    .then(server => {
-      setupGracefulShutdown(server);
-    })
-    .catch(error => {
-      log('error', 'Failed to start application', { error: error.message });
-      process.exit(1);
-    });
+  startServer().catch((err) => {
+    log('error', 'Failed to start server', { error: err.message });
+    process.exit(1);
+  });
 }
 
-module.exports = { TokenProxyApp, TokenService, TokenCache, config };
+module.exports = { app, startServer, tokenCache, config };
