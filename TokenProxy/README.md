@@ -1,6 +1,6 @@
-# Token Proxy v2.0 - Production Implementation
+# Token Proxy v2.0 
 
-Production-grade OAuth2 token proxy for OHIF-VNA integration implementing all requirements from `TOKEN-PROXY-PRODUCTION-REQUIREMENTS.md`.
+OAuth2 token proxy for OHIF-VNA integration.
 
 ## Features
 
