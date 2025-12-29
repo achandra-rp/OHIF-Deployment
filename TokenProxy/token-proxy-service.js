@@ -39,7 +39,7 @@ const configSchema = z.object({
   PROXY_API_KEY: z.string().optional(),
 
   // Header allowlist
-  FORWARDED_HEADER_ALLOWLIST: z.string().default('accept,content-type,rp-vna-site-id'),
+  FORWARDED_HEADER_ALLOWLIST: z.string().default('accept,content-type,rp-vna-site-id,rp-vna-operation-location,rp-vna-cross-site-query,rp-vna-site-group-expansion,rp-vna-exclude-default-tags,rp-vna-include-private-block,rp-vna-generate-store-uids,rp-vna-qc-trusted,rp-vna-qc-trusted-allow-null-overwrites,dicompatientid,dicompatientname,dicomissuerofpatientid'),
 
   // Body size limit
   BODY_SIZE_LIMIT_MB: z.coerce.number().default(10),
@@ -240,6 +240,7 @@ class TokenCache {
     this.token = null;
     this.expiresAtMs = 0;
     this.inflightPromise = null;
+    this.expiresInSec = 0;
   }
 
   isValid(nowMs, bufferMs) {
@@ -249,7 +250,7 @@ class TokenCache {
   async getToken(fetchFn, nowMs, bufferSec) {
     if (this.isValid(nowMs, bufferSec * 1000)) {
       tokenCacheHits.inc();
-      return this.token;
+      return { access_token: this.token, expires_in: this.expiresInSec };
     }
 
     tokenCacheMisses.inc();
@@ -259,8 +260,9 @@ class TokenCache {
         .then(tokenResponse => {
           this.token = tokenResponse.access_token;
           this.expiresAtMs = nowMs + (tokenResponse.expires_in * 1000);
+          this.expiresInSec = tokenResponse.expires_in;
           this.inflightPromise = null;
-          return this.token;
+          return tokenResponse;
         })
         .catch(err => {
           this.inflightPromise = null;
@@ -399,10 +401,6 @@ function buildForwardHeaders(req, token, siteId) {
   }
 
   headers['Authorization'] = `Bearer ${token}`;
-  headers['Accept'] = 'application/dicom+json';
-  if (req.method !== 'GET') {
-    headers['Content-Type'] = 'application/dicom+json';
-  }
   headers['Rp-Vna-Site-Id'] = siteId;
 
   return headers;
@@ -448,7 +446,8 @@ async function makeVnaRequest(requestConfig) {
         httpsAgent: keepAliveHttpsAgent,
         timeout: config.VNA_TIMEOUT_MS,
         maxRedirects: 5,
-        validateStatus: () => true
+        responseType: 'stream',
+        validateStatus: (status) => status >= 200 && status < 500
       });
 
       endTimer({ status_code: response.status });
@@ -475,12 +474,6 @@ const vnaRequestBreaker = createCircuitBreaker(makeVnaRequest, 'vnaRequest');
 
 const app = express();
 
-// Body parser with size limit
-const bodySizeLimit = `${config.BODY_SIZE_LIMIT_MB}mb`;
-app.use(express.json({ limit: bodySizeLimit }));
-app.use(express.urlencoded({ extended: true, limit: bodySizeLimit }));
-app.use(express.raw({ limit: bodySizeLimit, type: 'application/dicom' }));
-
 // Request ID and Trace ID middleware
 app.use((req, res, next) => {
   req.requestId = req.headers['x-request-id'] || uuidv4();
@@ -498,7 +491,7 @@ app.use((req, res, next) => {
     const durationNs = Number(process.hrtime.bigint() - start);
     const durationSec = durationNs / 1e9;
 
-    const route = req.route?.path || req.path;
+    const route = req.route?.path || (req.path.startsWith('/proxy') ? '/proxy' : req.path);
     const labels = {
       method: req.method,
       route,
@@ -634,19 +627,25 @@ app.get('/token', async (req, res) => {
   return tracer.startActiveSpan('getToken', async (span) => {
     try {
       const nowMs = Date.now();
-      const token = await tokenCache.getToken(
+      const tokenResponse = await tokenCache.getToken(
         () => tokenFetchBreaker.fire(),
         nowMs,
         config.TOKEN_EXPIRY_BUFFER_SEC
       );
+      const token = tokenResponse.access_token;
 
       span.setStatus({ code: SpanStatusCode.OK });
       span.end();
 
+      const remainingTtlSec = Math.max(
+        0,
+        Math.floor((tokenCache.expiresAtMs - Date.now()) / 1000)
+      );
+
       res.json({
         access_token: token,
         token_type: 'Bearer',
-        expires_in: config.TOKEN_CACHE_TTL_SEC - config.TOKEN_EXPIRY_BUFFER_SEC
+        expires_in: remainingTtlSec
       });
 
     } catch (err) {
@@ -686,11 +685,12 @@ app.use('/proxy', async (req, res) => {
     try {
       // Get token
       const nowMs = Date.now();
-      const token = await tokenCache.getToken(
+      const tokenResponse = await tokenCache.getToken(
         () => tokenFetchBreaker.fire(),
         nowMs,
         config.TOKEN_EXPIRY_BUFFER_SEC
       );
+      const token = tokenResponse.access_token;
 
       // Build target URL
       let urlPath = req.url.replace(/^\/?proxy\/?/, '');
@@ -723,7 +723,9 @@ app.use('/proxy', async (req, res) => {
         method: req.method,
         url: targetUrl,
         headers,
-        data: req.body
+        data: req,
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity
       });
 
       // Forward response status
@@ -748,7 +750,11 @@ app.use('/proxy', async (req, res) => {
       span.setStatus({ code: SpanStatusCode.OK });
       span.end();
 
-      res.send(response.data);
+      if (response.data && typeof response.data.pipe === 'function') {
+        response.data.pipe(res);
+      } else {
+        res.send(response.data);
+      }
 
     } catch (err) {
       span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
@@ -761,6 +767,9 @@ app.use('/proxy', async (req, res) => {
       });
 
       if (err.response) {
+        if (err.response.status === 401 || err.response.status === 403) {
+          tokenCache.clear();
+        }
         res.status(err.response.status || 502).json({
           error: 'proxy_error',
           code: 'UPSTREAM_ERROR',

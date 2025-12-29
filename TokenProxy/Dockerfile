@@ -1,5 +1,5 @@
 # Build stage
-FROM node:20-alpine AS builder
+FROM node:20-alpine3.19 AS builder
 
 WORKDIR /app
 
@@ -10,7 +10,7 @@ COPY package.json ./
 RUN npm install --only=production && npm cache clean --force
 
 # Production stage
-FROM node:20-alpine
+FROM node:20-alpine3.19
 
 # Security: Use the built-in non-root user (uid 1000)
 
