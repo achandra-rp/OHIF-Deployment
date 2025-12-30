@@ -37,12 +37,20 @@ echo ""
 echo "4. Testing VNA proxy..."
 VNA_URL="http://localhost:3000/proxy/rpvna-dev/rp/vna/query/studies?limit=2"
 TMP_RESPONSE="/tmp/token-proxy-vna-response.json"
-HTTP_CODE=$(curl -sS -o "$TMP_RESPONSE" -w "%{http_code}" "$VNA_URL")
+HTTP_CODE=$(curl -sS -o "$TMP_RESPONSE" -w "%{http_code}" \
+  -H 'Accept: application/dicom+json' \
+  -H 'rp-vna-site-id: RPVNA-1' \
+  "$VNA_URL")
 RESPONSE_SIZE=$(wc -c < "$TMP_RESPONSE" | tr -d ' ')
 
 echo "   URL: $VNA_URL"
 echo "   HTTP status: $HTTP_CODE"
 echo "   Response size: $RESPONSE_SIZE bytes"
+if [[ "$HTTP_CODE" != "200" ]]; then
+  echo "   Proxy call failed (expected 200). Body preview:"
+  head -c 400 "$TMP_RESPONSE"
+  exit 1
+fi
 if command -v jq >/dev/null 2>&1; then
   echo "   Response preview (first 2 items):"
   jq '.[0:2]' "$TMP_RESPONSE"

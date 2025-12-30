@@ -36,11 +36,20 @@ echo "   Token length: $TOKEN_LENGTH characters"
 echo "4. Testing VNA proxy..."
 VNA_URL="http://localhost:3000/proxy/rpvna-dev/rp/vna/query/studies?limit=2"
 VNA_TMP="/tmp/token-proxy-vna-response.json"
-VNA_HTTP_CODE=$(curl -sS --max-time 30 -o "$VNA_TMP" -w "%{http_code}" "$VNA_URL")
+VNA_HTTP_CODE=$(curl -sS --max-time 30 -o "$VNA_TMP" -w "%{http_code}" \
+  -H 'Accept: application/dicom+json' \
+  -H 'rp-vna-site-id: RPVNA-1' \
+  "$VNA_URL")
 VNA_SIZE=$(wc -c < "$VNA_TMP" | tr -d ' ')
 echo "   URL: $VNA_URL"
 echo "   HTTP status: $VNA_HTTP_CODE"
 echo "   Response size: $VNA_SIZE bytes"
+if [[ "$VNA_HTTP_CODE" != "200" ]]; then
+  echo "   Proxy call failed (expected 200). Body preview:"
+  head -c 400 "$VNA_TMP"
+  exit 1
+fi
+
 if command -v jq >/dev/null 2>&1; then
   echo "   Response preview (first 2 items):"
   jq '.[0:2]' "$VNA_TMP"
