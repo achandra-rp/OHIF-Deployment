@@ -203,7 +203,6 @@ for i in "${!MODEL_LABELS[@]}"; do
   elapsed="?"
   [[ -f "$timing_file" ]] && elapsed=$(cat "$timing_file")
 
-  local line_count
   line_count=$(wc -l < "$file" 2>/dev/null || echo 0)
   if [[ -s "$file" ]] && [[ "$line_count" -gt 5 ]]; then
     (( USABLE++ )) || true
