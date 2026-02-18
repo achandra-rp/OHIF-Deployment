@@ -1,0 +1,44 @@
+name: Multi-Model Code Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to review'
+        required: true
+        type: number
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    env:
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+      GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+      CI: true
+      NO_COLOR: 1
+      TERM: dumb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install GitHub Copilot CLI
+        run: npm install -g @github/copilot
+
+      - name: Verify Copilot CLI
+        run: copilot --version
+
+      - name: Run Multi-Model Review
+        run: bash .github/scripts/multi-model-review.sh
+        env:
+          PR_NUMBER: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
