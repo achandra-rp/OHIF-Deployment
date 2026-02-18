@@ -17,6 +17,7 @@ jobs:
       pull-requests: write
       contents: read
     env:
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
       GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
       GH_TOKEN: ${{ secrets.COPILOT_PAT }}
       CI: true
@@ -36,6 +37,13 @@ jobs:
 
       - name: Verify Copilot CLI
         run: copilot --version
+
+      - name: Debug auth
+        run: |
+          echo "COPILOT_GITHUB_TOKEN set: $([ -n "$COPILOT_GITHUB_TOKEN" ] && echo yes || echo no)"
+          echo "GITHUB_TOKEN set: $([ -n "$GITHUB_TOKEN" ] && echo yes || echo no)"
+          echo "Token prefix: ${COPILOT_GITHUB_TOKEN:0:4}..."
+          copilot -p "say hello" -s --model gpt-5-mini < /dev/null 2>&1 | head -20
 
       - name: Run Multi-Model Review
         run: bash .github/scripts/multi-model-review.sh
