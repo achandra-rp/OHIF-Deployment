@@ -142,15 +142,20 @@ review_with_model() {
   echo "  Starting review with ${label}..."
 
   # copilot CLI in headless mode
-  # Use 'copilot' binary directly (installed via npm @github/copilot)
-  # Falls back to 'gh copilot --' if standalone binary not found
+  # stdout -> review file, stderr -> separate log for debugging
   timeout 600 copilot \
     -p "$REVIEW_PROMPT" \
     --model "$model" \
     --allow-all-tools \
     --no-custom-instructions \
     -s \
-    < /dev/null > "$output" 2>&1 || true
+    < /dev/null > "$output" 2>"${output}.log" || true
+
+  # If stdout is empty, copilot may have written everything to stderr
+  if [[ ! -s "$output" ]] && [[ -s "${output}.log" ]]; then
+    echo "  ${label}: stdout empty, checking stderr log..."
+    cat "${output}.log" >&2
+  fi
 
   local end_time
   end_time=$(date +%s)
@@ -198,7 +203,9 @@ for i in "${!MODEL_LABELS[@]}"; do
   elapsed="?"
   [[ -f "$timing_file" ]] && elapsed=$(cat "$timing_file")
 
-  if [[ -s "$file" ]] && ! grep -q "Review failed" "$file"; then
+  local line_count
+  line_count=$(wc -l < "$file" 2>/dev/null || echo 0)
+  if [[ -s "$file" ]] && [[ "$line_count" -gt 5 ]]; then
     (( USABLE++ )) || true
     REVIEW_CONTENT="${REVIEW_CONTENT}
 
@@ -276,7 +283,7 @@ timeout 300 copilot \
   --allow-all-tools \
   --no-custom-instructions \
   -s \
-  < /dev/null > "$WORKDIR/consolidated.md" 2>&1 || true
+  < /dev/null > "$WORKDIR/consolidated.md" 2>"$WORKDIR/synthesis.log" || true
 
 if [[ ! -s "$WORKDIR/consolidated.md" ]]; then
   echo "WARNING: Synthesis failed, posting raw reviews instead"
