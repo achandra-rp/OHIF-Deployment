@@ -17,8 +17,8 @@ jobs:
       pull-requests: write
       contents: read
     env:
-      GITHUB_TOKEN: ${{ github.token }}
-      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+      GH_TOKEN: ${{ secrets.COPILOT_PAT }}
       CI: true
       NO_COLOR: 1
       TERM: dumb

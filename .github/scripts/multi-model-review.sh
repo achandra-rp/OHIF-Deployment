@@ -150,7 +150,7 @@ review_with_model() {
     --allow-all-tools \
     --no-custom-instructions \
     -s \
-    < /dev/null > "$output" 2>/dev/null || true
+    < /dev/null > "$output" 2>&1 || true
 
   local end_time
   end_time=$(date +%s)
@@ -276,7 +276,7 @@ timeout 300 copilot \
   --allow-all-tools \
   --no-custom-instructions \
   -s \
-  < /dev/null > "$WORKDIR/consolidated.md" 2>/dev/null || true
+  < /dev/null > "$WORKDIR/consolidated.md" 2>&1 || true
 
 if [[ ! -s "$WORKDIR/consolidated.md" ]]; then
   echo "WARNING: Synthesis failed, posting raw reviews instead"
